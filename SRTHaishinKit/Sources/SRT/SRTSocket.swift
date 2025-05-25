@@ -126,11 +126,13 @@ final actor SRTSocket {
 
     func reconnect(_ uri: URL?) async {
         await stopRunning() // Clean up previous connection
-        socket = SRTSocket() // Ensure fresh socket initialization
-        do {
-            try await open(uri)
-        } catch {
-            logger.error("Reconnect failed: \(error)")
+        self.socket = srt_create_socket() 
+    do {
+        guard let srtURL = uri.flatMap(SRTSocketURL.init) else {
+        throw Error.unsupportedUri(uri)
+    }
+    try await open(srtURL) // ✅ Now passing the correct type    } catch {
+        logger.error("Reconnect failed: \(error)")
         }
     }
 
