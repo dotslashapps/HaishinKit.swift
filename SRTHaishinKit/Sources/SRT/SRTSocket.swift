@@ -12,68 +12,27 @@ final actor SRTSocket {
     }
 
     enum Status: Int, CustomDebugStringConvertible {
-        case unknown
-        case `init`
-        case opened
-        case listening
-        case connecting
-        case connected
-        case broken
-        case closing
-        case closed
-        case nonexist
+        case unknown, `init`, opened, listening, connecting, connected, broken, closing, closed, nonexist
 
         var debugDescription: String {
             switch self {
-            case .unknown:
-                return "unknown"
-            case .`init`:
-                return "init"
-            case .opened:
-                return "opened"
-            case .listening:
-                return "listening"
-            case .connecting:
-                return "connecting"
-            case .connected:
-                return "connected"
-            case .broken:
-                return "broken"
-            case .closing:
-                return "closing"
-            case .closed:
-                return "closed"
-            case .nonexist:
-                return "nonexist"
+            case .unknown: return "unknown"
+            case .`init`: return "init"
+            case .opened: return "opened"
+            case .listening: return "listening"
+            case .connecting: return "connecting"
+            case .connected: return "connected"
+            case .broken: return "broken"
+            case .closing: return "closing"
+            case .closed: return "closed"
+            case .nonexist: return "nonexist"
             }
         }
 
         init?(_ status: SRT_SOCKSTATUS) {
             self.init(rawValue: Int(status.rawValue))
-            defer {
-                logger.trace(debugDescription)
-            }
+            defer { logger.trace(debugDescription) }
         }
-    }
-
-    var inputs: AsyncStream<Data> {
-        AsyncStream<Data> { continuation in
-            // If Task.detached is not used, closing will result in a deadlock.
-            Task.detached {
-                while await self.connected {
-                    let result = await self.recvmsg()
-                    if 0 <= result {
-                        continuation.yield(await self.incomingBuffer.subdata(in: 0..<Data.Index(result)))
-                    } else {
-                        continuation.finish()
-                    }
-                }
-            }
-        }
-    }
-
-    var performanceData: SRTPerformanceData {
-        .init(mon: perf)
     }
 
     var status: Status {
@@ -83,14 +42,12 @@ final actor SRTSocket {
     private(set) var isRunning = false
     private var perf: CBytePerfMon = .init()
     private var socket: SRTSOCKET = SRT_INVALID_SOCK
-    private var outputs: AsyncStream<Data>.Continuation? {
-        didSet {
-            oldValue?.finish()
-        }
-    }
+    private var outputs: AsyncStream<Data>.Continuation?
+
     private var connected: Bool {
         status == .connected
     }
+
     private var windowSizeC: Int32 = 1024 * 4
     private lazy var incomingBuffer: Data = .init(count: Int(windowSizeC))
 
@@ -108,12 +65,16 @@ final actor SRTSocket {
         }
     }
 
-    func getSocketOption(_ name: SRTSocketOption.Name) throws -> SRTSocketOption {
-        return try SRTSocketOption(name: name, socket: socket)
-    }
-
-    func setSocketOption(_ option: SRTSocketOption) throws {
-        try option.setSockflag(socket)
+    var statusUpdates: AsyncStream<Status> {
+        AsyncStream { continuation in
+            Task.detached {
+                while self.status != .closed {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000) // Check every 2 seconds
+                    continuation.yield(self.status)
+                }
+                continuation.finish()
+            }
+        }
     }
 
     func open(_ url: SRTSocketURL) async throws {
@@ -123,36 +84,31 @@ final actor SRTSocket {
         guard configure(url.options, restriction: .pre) else {
             throw makeSocketError()
         }
+
         let status: Int32 = try {
             switch url.mode {
             case .caller:
-                guard var remote = url.remote else {
-                    return SRT_ERROR
-                }
+                guard var remote = url.remote else { return SRT_ERROR }
                 var remoteaddr = remote.makeSockaddr()
                 return srt_connect(socket, &remoteaddr, Int32(remote.size))
             case .listener:
-                guard var local = url.local else {
-                    return SRT_ERROR
-                }
+                guard var local = url.local else { return SRT_ERROR }
                 var localaddr = local.makeSockaddr()
                 let status = srt_bind(socket, &localaddr, Int32(local.size))
-                guard status != SRT_ERROR else {
-                    throw makeSocketError()
-                }
+                guard status != SRT_ERROR else { throw makeSocketError() }
                 return srt_listen(socket, 1)
             case .rendezvous:
-                guard var remote = url.remote, var local = url.local else {
-                    return SRT_ERROR
-                }
+                guard var remote = url.remote, var local = url.local else { return SRT_ERROR }
                 var remoteaddr = remote.makeSockaddr()
                 var localaddr = local.makeSockaddr()
                 return srt_rendezvous(socket, &remoteaddr, Int32(remote.size), &localaddr, Int32(local.size))
             }
         }()
+
         guard status != SRT_ERROR else {
             throw makeSocketError()
         }
+
         switch url.mode {
         case .listener:
             break
@@ -164,24 +120,17 @@ final actor SRTSocket {
                 incomingBuffer = .init(count: Int(windowSizeC))
             }
         }
+
         await startRunning()
     }
 
-    func accept(_ options: [SRTSocketOption]) async throws -> SRTSocket {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<SRTSocket, Swift.Error>) in
-            Task.detached { [self] in
-                do {
-                    let accept = srt_accept(await socket, nil, nil)
-                    guard -1 < accept else {
-                        throw await makeSocketError()
-                    }
-                    let socket = try await SRTSocket(socket: accept, options: options)
-                    await socket.startRunning()
-                    continuation.resume(returning: socket)
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
+    func reconnect(_ uri: URL?) async {
+        await stopRunning() // Clean up previous connection
+        socket = SRTSocket() // Ensure fresh socket initialization
+        do {
+            try await open(uri)
+        } catch {
+            logger.error("Reconnect failed: \(error)")
         }
     }
 
@@ -189,9 +138,23 @@ final actor SRTSocket {
         guard connected else {
             throw Error.notConnected
         }
-        for data in data.chunk(Self.payloadSize) {
-            outputs?.yield(data)
+        for chunk in data.chunk(Self.payloadSize) {
+            outputs?.yield(chunk)
         }
+    }
+
+    private func makeSocketError() -> SRTError {
+        let errorCode = srt_getlasterror(nil) // Capture actual error code
+        let errorMessage = String(cString: srt_getlasterror_str())
+
+        defer { logger.error("[SRT Error \(errorCode)]: \(errorMessage)") }
+
+        if socket != SRT_INVALID_SOCK {
+            srt_close(socket)
+            socket = SRT_INVALID_SOCK
+        }
+
+        return .illegalState(message: "[\(errorCode)] \(errorMessage)")
     }
 
     private func configure(_ options: [SRTSocketOption], restriction: SRTSocketOption.Restriction) -> Bool {
@@ -210,26 +173,6 @@ final actor SRTSocket {
         return true
     }
 
-    private func bstats() -> Int32 {
-        guard socket != SRT_INVALID_SOCK else {
-            return SRT_ERROR
-        }
-        return srt_bstats(socket, &perf, 1)
-    }
-
-    private func makeSocketError() -> SRTError {
-        let error_message = String(cString: srt_getlasterror_str())
-        defer {
-            logger.error(error_message)
-        }
-        if socket != SRT_INVALID_SOCK {
-            srt_close(socket)
-            socket = SRT_INVALID_SOCK
-        }
-        return .illegalState(message: error_message)
-    }
-
-    @inline(__always)
     private func sendmsg(_ data: Data) -> Int32 {
         return data.withUnsafeBytes { pointer in
             guard let buffer = pointer.baseAddress?.assumingMemoryBound(to: CChar.self) else {
@@ -239,7 +182,6 @@ final actor SRTSocket {
         }
     }
 
-    @inline(__always)
     private func recvmsg() -> Int32 {
         return incomingBuffer.withUnsafeMutableBytes { pointer in
             guard let buffer = pointer.baseAddress?.assumingMemoryBound(to: CChar.self) else {
@@ -251,14 +193,12 @@ final actor SRTSocket {
 }
 
 extension SRTSocket: AsyncRunner {
-    // MARK: AsyncRunner
     func startRunning() async {
-        guard !isRunning else {
-            return
-        }
+        guard !isRunning else { return }
         let stream = AsyncStream<Data> { continuation in
             self.outputs = continuation
         }
+
         Task {
             for await data in stream {
                 let result = sendmsg(data)
@@ -267,33 +207,15 @@ extension SRTSocket: AsyncRunner {
                 }
             }
         }
+
         isRunning = true
     }
 
     func stopRunning() async {
-        guard isRunning else {
-            return
-        }
+        guard isRunning else { return }
         srt_close(socket)
         socket = SRT_INVALID_SOCK
         outputs = nil
         isRunning = false
-    }
-}
-
-extension SRTSocket: NetworkTransportReporter {
-    // MARK: NetworkTransportReporter
-    func makeNetworkTransportReport() -> NetworkTransportReport {
-        _ = bstats()
-        let performanceData = self.performanceData
-        return .init(
-            queueBytesOut: Int(performanceData.byteSndBuf),
-            totalBytesIn: Int(performanceData.byteRecvTotal),
-            totalBytesOut: Int(performanceData.byteSentTotal)
-        )
-    }
-
-    func makeNetworkMonitor() -> NetworkMonitor {
-        return .init(self)
     }
 }
